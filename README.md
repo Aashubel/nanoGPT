@@ -1,2 +1,2 @@
-i  was interested in tweakiing the small part of the nano gpt which is positioanal embedding with rotational position embedding to see what happens , well nothing much happend the daa set was same  tiny shakespeare , the model memorized the training data and didnt peroform well on validation data ( overfit) , 
+i  was interested in tweakiing the small part of the nano gpt which is positional embedding with rotational position embedding to see what happens , well nothing much happend the daa set was same  tiny shakespeare , the model memorized the training data and didnt peroform well on validation data ( overfit) , 
 reason could be that maybe it RoPE to perform well needs large data set and not tiny ones , i will test it more and do more tweaking and share it
