@@ -41,6 +41,39 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        
+        # Calculate head dimension (how many features each attention head processes)
+        self.head_dim = config.n_embd // config.n_head
+        
+        # For RoPE, we typically apply rotation to half of the head dimension
+        # This means if head_dim is 64, we rotate 32 dimensions (16 pairs)
+        self.rotary_dim = self.head_dim // 2
+        
+        # Create pre-computed cos and sin values for all possible positions
+        # This is more efficient than computing them every time
+        # We create these for positions 0 to block_size-1
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim))
+        # inv_freq creates frequencies like [1, 1/10000^(2/32), 1/10000^(4/32), ...]
+        # This gives us different rotation speeds for different dimensions
+        
+        # Create position indices from 0 to block_size-1
+        pos = torch.arange(config.block_size)
+        # pos is [0, 1, 2, ..., block_size-1]
+        
+        # Compute cos and sin for each position and frequency
+        # This creates a matrix where each row is a position and each column is a frequency
+        freqs = torch.outer(pos, inv_freq)
+        # freqs[i, j] = position_i * inv_freq_j
+        
+        # Apply cos and sin to get rotation values
+        cos = torch.cos(freqs)  # Shape: (block_size, rotary_dim//2)
+        sin = torch.sin(freqs)  # Shape: (block_size, rotary_dim//2)
+        
+        # Register these as buffers (they don't get updated during training, just stored)
+        # This saves memory and computation
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+        
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -48,6 +81,62 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+    
+    def apply_rotary_pos_emb(self, x, seq_len):
+        """
+        Apply rotary positional embeddings to the input tensor x.
+        
+        Args:
+            x: Input tensor of shape (batch_size, n_heads, seq_len, head_dim)
+            seq_len: Length of the current sequence (can be smaller than block_size)
+        
+        Returns:
+            Tensor with RoPE applied, same shape as input
+        """
+        # Get the cos and sin values for the current sequence length
+        # We only need values for positions 0 to seq_len-1
+        cos = self.cos[:seq_len]  # Shape: (seq_len, rotary_dim//2)
+        sin = self.sin[:seq_len]  # Shape: (seq_len, rotary_dim//2)
+        
+        # We need to reshape cos and sin to match the dimensions of x
+        # x has shape (batch_size, n_heads, seq_len, head_dim)
+        # cos and sin need to be (1, 1, seq_len, rotary_dim//2) to broadcast properly
+        cos = cos.unsqueeze(0).unsqueeze(0)  # Add batch and head dimensions
+        sin = sin.unsqueeze(0).unsqueeze(0)  # Add batch and head dimensions
+        
+        # Split x into the part we'll rotate and the part we'll leave unchanged
+        # We only rotate the first rotary_dim dimensions
+        x_rot = x[..., :self.rotary_dim]  # Shape: (batch_size, n_heads, seq_len, rotary_dim)
+        x_pass = x[..., self.rotary_dim:]  # Shape: (batch_size, n_heads, seq_len, head_dim - rotary_dim)
+        
+        # Split x_rot into even and odd dimensions (pairs for rotation)
+        # This is because RoPE rotates pairs of dimensions together
+        x_even = x_rot[..., ::2]  # Take every even index: 0, 2, 4, ...
+        x_odd = x_rot[..., 1::2]  # Take every odd index: 1, 3, 5, ...
+        
+        # Apply the rotation formula: R(θ) = [cos(θ) -sin(θ); sin(θ) cos(θ)]
+        # For each pair (x_even, x_odd), we compute:
+        # new_x_even = x_even * cos - x_odd * sin
+        # new_x_odd = x_even * sin + x_odd * cos
+        
+        # First rotation: x_even * cos - x_odd * sin
+        x_even_rot = x_even * cos - x_odd * sin
+        
+        # Second rotation: x_even * sin + x_odd * cos  
+        x_odd_rot = x_even * sin + x_odd * cos
+        
+        # Interleave the rotated even and odd dimensions back together
+        # We use torch.stack to combine them and then reshape
+        x_rot_combined = torch.stack([x_even_rot, x_odd_rot], dim=-1)
+        # This creates shape (batch_size, n_heads, seq_len, rotary_dim//2, 2)
+        
+        # Reshape back to (batch_size, n_heads, seq_len, rotary_dim)
+        x_rot_combined = x_rot_combined.view(*x_rot.shape)
+        
+        # Concatenate the rotated part with the unchanged part
+        x_out = torch.cat([x_rot_combined, x_pass], dim=-1)
+        
+        return x_out
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -57,6 +146,15 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        
+        # Apply RoPE (Rotary Positional Embeddings) to query and key tensors
+        # This injects positional information directly into the attention computation
+        # We pass the sequence length T so RoPE knows how many positions to handle
+        q = self.apply_rotary_pos_emb(q, T)  # Apply rotation to queries
+        k = self.apply_rotary_pos_emb(k, T)  # Apply rotation to keys
+        
+        # Note: We don't apply RoPE to values (v) because values don't need positional information
+        # Values represent the content, while queries and keys represent the relationship between positions
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -125,7 +223,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -156,7 +253,10 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            # With RoPE, we don't have learnable positional embeddings
+            # So we don't need to subtract anything from the parameter count
+            # All parameters are now part of the core model weights
+            pass
         return n_params
 
     def _init_weights(self, module):
@@ -171,12 +271,10 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,9 +296,18 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        
+        # With RoPE, we need to crop the cos and sin buffers to match the new block size
+        # This ensures we don't try to access positions beyond our new sequence length
         for block in self.transformer.h:
+            if hasattr(block.attn, 'cos'):
+                # Crop cos buffer to new block size
+                block.attn.cos = block.attn.cos[:block_size]
+            if hasattr(block.attn, 'sin'):
+                # Crop sin buffer to new block size
+                block.attn.sin = block.attn.sin[:block_size]
             if hasattr(block.attn, 'bias'):
+                # Crop attention bias mask to new block size
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
